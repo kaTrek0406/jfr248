@@ -32,6 +32,18 @@ DEFAULT_GROUP = os.getenv("DEFAULT_GROUP", "JFR-237")
 DOCX_PATH = os.getenv("DOCX_PATH", "").strip()
 DOCX_GLOB = os.getenv("DOCX_GLOB", "").strip()
 
+ROMAN_PREFIX = re.compile(r"^\s*(?:I|II|III|IV|V|VI|VII|VIII|IX|X)\s+", re.IGNORECASE)
+
+def parse_ora_cell(ora: str):
+    o = normalize_sup(ora)
+    o = ROMAN_PREFIX.sub("", o)
+    m = re.search(r'(\d{1,2})[:\. ]?(\d{2})\s*-\s*(\d{1,2})[:\. ]?(\d{2})', o)
+    if not m:
+        return None, None
+    h1, m1, h2, m2 = map(int, m.groups())
+    return f"{h1:02d}:{m1:02d}", f"{h2:02d}:{m2:02d}"
+
+
 def get_tz():
     if ZoneInfo is not None:
         try:
@@ -254,13 +266,25 @@ def parse_group_cell(txt: str):
     return title, teacher, room
 
 def normalize_date(s: str):
-    s = (s or "").strip().lower()
-    # уберём день недели (luni, marti, miercuri...)
-    s = re.sub(r"\b(luni|marți|marti|miercuri|joi|vineri|sâmbătă|duminică)\b", "", s, flags=re.IGNORECASE)
-    s = s.strip()
+    s = (s or "").strip()
+    s = re.sub(
+        r"\b(luni|marți|marti|miercuri|joi|vineri|sâmbătă|simbata|duminică|duminica)\b",
+        "", s, flags=re.IGNORECASE
+    )
+    s = re.sub(r"\s+", " ", s).strip()
+
+    m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", s)
+    if m: return s
+
     m = re.fullmatch(r"(\d{1,2})\.(\d{1,2})\.(\d{4})", s)
     if m:
         d, mnt, y = map(int, m.groups())
+        return datetime(y, mnt, d).strftime("%Y-%m-%d")
+
+    m = re.fullmatch(r"(\d{1,2})\.(\d{1,2})", s)
+    if m:
+        d, mnt = map(int, m.groups())
+        y = datetime.now(TZ).year
         return datetime(y, mnt, d).strftime("%Y-%m-%d")
     return None
 
@@ -307,8 +331,9 @@ def parse_docx_to_db(path: str, target_group: str):
             if len(cells) < 2:
                 continue
 
-            date_raw = re.sub(r"\s+", " ", (cells[0] or "").strip())
-            date_norm = normalize_date(date_raw) if date_raw else current_date
+            date_raw = re.sub(r"\s+", " ", (cells[0] or "")).strip()
+            tmp_date = normalize_date(date_raw) if date_raw else None
+            date_norm = tmp_date or current_date
 
             time_raw = re.sub(r"\s+", " ", (cells[1] or "").strip())
             t1, t2 = parse_ora_cell(time_raw)
