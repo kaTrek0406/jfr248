@@ -79,6 +79,8 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_events_date_group ON events(date, group_code);
 """
 
+
+
 def db():
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
@@ -216,77 +218,68 @@ SUP = str.maketrans({
 })
 
 def normalize_sup(s: str) -> str:
-    s = (s or "").strip().translate(SUP)
-    s = s.replace("–", "-").replace("—", "-").replace("‒", "-")
-    s = re.sub(r"\s+", " ", s)
-    return s
-
+    s = (s or "").translate(SUP)
+    s = s.replace("–","-").replace("—","-").replace("‒","-")
+    return re.sub(r"\s+", " ", s).strip()
 def parse_ora_cell(ora: str):
-    """'9⁴⁵-11¹⁵' / '15:00–16:30' -> ('09:45','11:15')"""
-    o = normalize_sup(ora)
-    m = re.search(r'(\d{1,2})[:\. ]?(\d{2})\s*-\s*(\d{1,2})[:\. ]?(\d{2})', o)
-    if not m:
-        return None, None
+    text = ROMAN_PREFIX.sub("", normalize_sup(ora))
+    m = re.search(r'(\d{1,2})[:\. ]?(\d{2})\s*-\s*(\d{1,2})[:\. ]?(\d{2})', text)
+    if not m: return None, None
     h1, m1, h2, m2 = map(int, m.groups())
     return f"{h1:02d}:{m1:02d}", f"{h2:02d}:{m2:02d}"
 
+
 def parse_group_cell(txt: str):
-    """
-    В ячейке колонки группы обычно 3 строки:
-    title
-    teacher
-    s. 423 / sala / aud.
-    """
     t = (txt or "").strip()
-    if not t:
-        return None, None, None
+    if not t: return None, None, None
     lines = [re.sub(r"\s+", " ", x.strip()) for x in t.splitlines() if x.strip()]
-    if not lines:
-        return None, None, None
+    if not lines: return None, None, None
 
     title = lines[0]
     teacher = None
     room = None
 
+    # аудитория: допускаем 423/biblioteca, Bl.2/s.102 и т.п.
     for line in lines[1:]:
-        m = re.search(r'\b(?:sală|s\.?|aud\.?|cab\.?|ауд\.?)\s*([0-9A-Za-z/\\\-]+)', line, re.IGNORECASE)
+        m = re.search(r'\b(?:sală|s\.?|aud\.?|cab\.?|ауд\.?)\s*([0-9A-Za-z./\\\- ]+)', line, re.IGNORECASE)
         if m and not room:
-            room = m.group(1)
+            room = m.group(1).strip()
 
     for line in lines[1:]:
         if room and re.search(r'\b(?:sală|s\.?|aud\.?|cab\.?|ауд\.?)\b', line, re.IGNORECASE):
             continue
         if any(w in line.lower() for w in ["dr.", "conf.", "prof.", "lector", "asistent", "universitar", "univ", "cadru"]):
-            teacher = line
-            break
+            teacher = line; break
         if re.search(r'[A-ZĂÂÎȘȚ]\.|[A-ZĂÂÎȘȚ][a-zăâîșț]+', line):
-            teacher = line
-            break
+            teacher = line; break
 
     return title, teacher, room
 
 def normalize_date(s: str):
     s = (s or "").strip()
-    s = re.sub(
-        r"\b(luni|marți|marti|miercuri|joi|vineri|sâmbătă|simbata|duminică|duminica)\b",
-        "", s, flags=re.IGNORECASE
-    )
+    # вычистим день недели (с/без диакритики)
+    s = re.sub(r"\b(luni|marți|marti|miercuri|joi|vineri|sâmbătă|simbata|duminică|duminica)\b",
+               "", s, flags=re.IGNORECASE)
     s = re.sub(r"\s+", " ", s).strip()
 
     m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", s)
     if m: return s
-
     m = re.fullmatch(r"(\d{1,2})\.(\d{1,2})\.(\d{4})", s)
     if m:
         d, mnt, y = map(int, m.groups())
         return datetime(y, mnt, d).strftime("%Y-%m-%d")
-
     m = re.fullmatch(r"(\d{1,2})\.(\d{1,2})", s)
     if m:
-        d, mnt = map(int, m.groups())
-        y = datetime.now(TZ).year
+        d, mnt = map(int, m.groups()); y = datetime.now(TZ).year
         return datetime(y, mnt, d).strftime("%Y-%m-%d")
     return None
+
+# --- TIME ---
+SUP = str.maketrans({
+    "⁰":"0","¹":"1","²":"2","³":"3","⁴":"4","⁵":"5","⁶":"6","⁷":"7","⁸":"8","⁹":"9",
+    "º":"0","˙":"", "’":"", "ː":":"
+})
+ROMAN_PREFIX = re.compile(r"^\s*(?:I|II|III|IV|V|VI|VII|VIII|IX|X)\s+", re.IGNORECASE)
 
 
 # ================== DOCX parser for 4-column layout ==================
@@ -295,66 +288,91 @@ def parse_docx_to_db(path: str, target_group: str):
     clear_group(target_group)
     inserted = 0
 
+    DATE_RE = re.compile(r'\b\d{1,2}\.\d{1,2}(?:\.\d{4})?\b')
+
     for table in doc.tables:
-        if len(table.rows) < 2 or len(table.columns) < 4:
+        nrows = len(table.rows)
+        if nrows < 2:
+            continue
+        ncols = len(table.rows[0].cells)
+
+        # соберём первые 2 строки как "шапку"
+        hdr0 = [re.sub(r"\s+", " ", c.text).strip().lower() for c in table.rows[0].cells]
+        hdr1 = [re.sub(r"\s+", " ", c.text).strip().lower() for c in table.rows[1].cells] if nrows > 1 else []
+        hdr = []
+        for i in range(ncols):
+            h = (hdr0[i] if i < len(hdr0) else "")
+            h2 = (hdr1[i] if i < len(hdr1) else "")
+            if h2 and h2 not in h: h = (h + " " + h2).strip()
+            hdr.append(h)
+
+        # 1) найдём date_col, time_col по содержимому
+        date_col = time_col = None
+        for col in range(ncols):
+            col_text = " | ".join(re.sub(r"\s+"," ", r.cells[col].text).strip() for r in table.rows[:min(8, nrows)])
+            if date_col is None and ( "data" in hdr[col] or "date" in hdr[col] or DATE_RE.search(col_text) ):
+                date_col = col
+            if time_col is None and ( "ora" in hdr[col] or "time" in hdr[col] or parse_ora_cell(col_text)[0] ):
+                time_col = col
+
+        if date_col is None or time_col is None:
+            # вероятнее всего это не нужная нам таблица
             continue
 
-        # заголовок может быть в 1-2 строках
-        hdr = [re.sub(r"\s+", " ", c.text).strip().lower() for c in table.rows[0].cells]
-        if len(table.rows) > 1:
-            hdr2 = [re.sub(r"\s+", " ", c.text).strip().lower() for c in table.rows[1].cells]
-            for i in range(min(len(hdr), len(hdr2))):
-                if hdr2[i] and hdr2[i] not in hdr[i]:
-                    hdr[i] = (hdr[i] + " " + hdr2[i]).strip()
-
-        def has(s, *keys): return any(k in s for k in keys)
-        if not has(hdr[0], "data", "date"):  # Data
-            continue
-        if not has(hdr[1], "ora", "time"):   # Ora
-            continue
-
+        # 2) найдём колонку нашей группы
         j_col = b_col = None
-        for idx, h in enumerate(hdr):
-            if "jfr" in h:
-                j_col = idx
-            if "bfr" in h:
-                b_col = idx
-        if j_col is None and b_col is None:
+        for col in range(ncols):
+            h = hdr[col]
+            if "jfr" in h or "jurnalism" in h:
+                j_col = col
+            if "bfr" in h or "bibliotec" in h:
+                b_col = col
+
+        # если в шапке не нашли, но таблица похожа на 4-колоночную -> возьмём 2 правых колонки как группы
+        if j_col is None and b_col is None and ncols >= 4:
+            # предполагаем: [Data][Ora][JFR][BFR]
+            j_col, b_col = (time_col + 1, time_col + 2) if time_col + 2 < ncols else (None, None)
+
+        group_col = j_col if target_group.upper().startswith("JFR") else b_col
+        if group_col is None:
+            # не можем сопоставить колонку с группой — пропускаем таблицу
             continue
 
-        # где начинается контент
-        start_row = 2 if any("jfr" in x or "bfr" in x for x in hdr) else 1
+        # 3) найдём первую строку с данными (где есть дата/время)
+        start_row = 0
+        for i in range(min(6, nrows)):
+            dcell = re.sub(r"\s+"," ", table.rows[i].cells[date_col].text).strip()
+            tcell = re.sub(r"\s+"," ", table.rows[i].cells[time_col].text).strip()
+            if normalize_date(dcell) or parse_ora_cell(tcell)[0]:
+                start_row = i; break
+        # подстрахуемся от шапки в 1–2 строки
+        start_row = max(start_row, 1)
 
-        current_date = None
+        last_date = None
         for r in table.rows[start_row:]:
-            cells = [c.text for c in r.cells]
-            if len(cells) < 2:
+            cells = r.cells
+            if len(cells) <= max(date_col, time_col, group_col):
                 continue
 
-            date_raw = re.sub(r"\s+", " ", (cells[0] or "")).strip()
+            # дата: падать назад на last_date, если встретился только 'joi/vineri'
+            date_raw = re.sub(r"\s+"," ", (cells[date_col].text or "")).strip()
             tmp_date = normalize_date(date_raw) if date_raw else None
-            date_norm = tmp_date or current_date
-
-            time_raw = re.sub(r"\s+", " ", (cells[1] or "").strip())
-            t1, t2 = parse_ora_cell(time_raw)
-
-            # выбираем колонку нашей группы
-            col = j_col if target_group.upper().startswith("JFR") else b_col
-            if col is None:
-                continue
-
-            gcell = cells[col] if col < len(cells) else ""
-            title, teacher, room = parse_group_cell(gcell)
-
+            date_norm = tmp_date or last_date
             if not date_norm:
                 continue
-            if not title:
-                current_date = date_norm
-                continue
 
-            insert_event(date_norm, t1, t2, title, teacher, room, target_group)
-            inserted += 1
-            current_date = date_norm
+            # время
+            time_raw = re.sub(r"\s+"," ", (cells[time_col].text or "")).strip()
+            t1, t2 = parse_ora_cell(time_raw)
+
+            # ячейка группы
+            gtxt = cells[group_col].text if group_col < len(cells) else ""
+            title, teacher, room = parse_group_cell(gtxt)
+
+            if title:
+                insert_event(date_norm, t1, t2, title, teacher, room, target_group)
+                inserted += 1
+            last_date = date_norm
 
     return inserted
 
@@ -404,6 +422,22 @@ def import_from_docx_path(target_group: str) -> int:
 # ================== BOT ==================
 router = Router()
 USER_GROUP = {}
+
+@router.message(Command("dump"))
+async def cmd_dump(m: Message):
+    from html import escape
+    p = os.getenv("DOCX_PATH", "").strip()
+    if not p or not os.path.isfile(p):
+        return await m.answer("DOCX_PATH не задан или файл не найден.")
+    doc = DocxDocument(p)
+    out = [f"Таблиц: {len(doc.tables)}"]
+    for ti, table in enumerate(doc.tables):
+        out.append(f"\n<b>Table {ti}</b> rows={len(table.rows)} cols={len(table.rows[0].cells) if table.rows else 0}")
+        for ri, row in enumerate(table.rows[:8]):  # первые 8 строк
+            cells = [re.sub(r'\\s+',' ', (c.text or '').strip()) for c in row.cells]
+            out.append(f"{ri:02d}: " + " | ".join(escape(x) if x else "·" for x in cells))
+    await m.answer("\n".join(out))
+
 
 @router.message(Command("start"))
 async def cmd_start(m: Message):
