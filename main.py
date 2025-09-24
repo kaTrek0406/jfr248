@@ -1,0 +1,526 @@
+import asyncio
+import glob
+import os
+import re
+import sqlite3
+import tempfile
+import zipfile
+from datetime import datetime, timedelta, date
+
+# ===== Timezone =====
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.filters import Command
+from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.client.default import DefaultBotProperties
+from aiogram.exceptions import TelegramBadRequest
+from dotenv import load_dotenv
+from docx import Document as DocxDocument
+from docx.opc.exceptions import PackageNotFoundError
+
+# ================== ENV / TZ ==================
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+DB_PATH = os.getenv("DB_PATH", "./schedule.db")
+TZNAME = os.getenv("TZ", "Europe/Chisinau")
+DEFAULT_GROUP = os.getenv("DEFAULT_GROUP", "JFR-237")
+DOCX_PATH = os.getenv("DOCX_PATH", "").strip()
+DOCX_GLOB = os.getenv("DOCX_GLOB", "").strip()
+
+def get_tz():
+    if ZoneInfo is not None:
+        try:
+            return ZoneInfo(TZNAME)
+        except Exception:
+            pass
+    from datetime import timezone
+    return timezone(timedelta(hours=3))  # Chisinau UTC+3 (fallback, без DST)
+TZ = get_tz()
+
+# ================== GROUPS ==================
+GROUP_LABELS = {
+    "JFR-237": "Jurnalism și procese mediatice — JFR-237",
+}
+GROUP_ALIASES = {
+    "Jurnalism și procese mediatice": "JFR-237",
+    "JFR - 237": "JFR-237",
+    "JFR-237": "JFR-237",
+}
+
+# ================== DB ==================
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date TEXT NOT NULL,
+    time_start TEXT,
+    time_end TEXT,
+    title TEXT NOT NULL,
+    teacher TEXT,
+    room TEXT,
+    group_code TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_events_date_group ON events(date, group_code);
+"""
+
+def db():
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    return con
+
+def init_db():
+    with db() as con:
+        for stmt in SCHEMA.strip().split(";"):
+            s = stmt.strip()
+            if s:
+                con.execute(s + ";")
+
+def clear_group(group_code: str):
+    with db() as con:
+        con.execute("DELETE FROM events WHERE group_code=?", (group_code,))
+
+def insert_event(date_str, t_start, t_end, title, teacher, room, group_code):
+    with db() as con:
+        con.execute(
+            "INSERT INTO events(date, time_start, time_end, title, teacher, room, group_code) VALUES(?,?,?,?,?,?,?)",
+            (date_str, t_start, t_end, title, teacher, room, group_code),
+        )
+
+def fetch_day_for_group(d: date, group_code: str):
+    ymd = d.strftime("%Y-%m-%d")
+    with db() as con:
+        cur = con.execute(
+            """SELECT * FROM events
+               WHERE date=? AND group_code=?
+               ORDER BY COALESCE(time_start,'99:99'), title""",
+            (ymd, group_code),
+        )
+        return cur.fetchall()
+
+def fetch_week_for_group(start: date, end: date, group_code: str):
+    with db() as con:
+        cur = con.execute(
+            """SELECT * FROM events
+               WHERE date BETWEEN ? AND ? AND group_code=?
+               ORDER BY date, COALESCE(time_start,'99:99'), title""",
+            (start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"), group_code),
+        )
+        return cur.fetchall()
+
+# ================== Helpers / UI ==================
+def week_bounds(any_day: date):
+    start = any_day - timedelta(days=any_day.weekday())  # Monday
+    end = start + timedelta(days=6)
+    return start, end
+
+def fmt_pair(row):
+    t1 = row["time_start"] or ""
+    t2 = row["time_end"] or ""
+    time_part = f"{t1}-{t2}" if (t1 and t2) else (t1 or "—")
+    title = row["title"] or ""
+    teacher = row["teacher"] or ""
+    room = row["room"] or ""
+    line = f"• <b>{time_part}</b> · <i>{title}</i>"
+    extras = []
+    if teacher: extras.append(f"👩‍🏫 {teacher}")
+    if room: extras.append(f"🏫 <b>{room}</b>")
+    if extras:
+        line += "\n  " + " · ".join(extras)
+    return line
+
+def fmt_day_block(d: date, rows, group_code: str):
+    head = f"📅 {d.strftime('%a, %d.%m.%Y')} — <b>{GROUP_LABELS.get(group_code, group_code)}</b>"
+    if not rows:
+        return f"{head}\nЗанятий нет."
+    items = "\n".join(fmt_pair(r) for r in rows)
+    return f"{head}\n{items}"
+
+def main_menu():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🗓 Выбрать день недели"), KeyboardButton(text="📅 Сегодня")],
+            [KeyboardButton(text="👥 Выбрать группу"), KeyboardButton(text="🗂 Эта неделя")],
+        ],
+        resize_keyboard=True,
+    )
+
+def days_keyboard(anchor: date):
+    start, end = week_bounds(anchor)
+    b = InlineKeyboardBuilder()
+
+    prev_txt = (start - timedelta(days=7)).strftime("%d.%m")
+    next_txt = (start + timedelta(days=7)).strftime("%d.%m")
+    mid_txt = f"Неделя {start.strftime('%d.%m')}–{end.strftime('%d.%m')}"
+
+    b.button(text=f"◀️ {prev_txt}", callback_data=f"wk:{(start - timedelta(days=7)).isoformat()}")
+    b.button(text=mid_txt, callback_data="noop")
+    b.button(text=f"▶️ {next_txt}", callback_data=f"wk:{(start + timedelta(days=7)).isoformat()}")
+    b.adjust(3)
+
+    weekdays = ["Пн","Вт","Ср","Чт","Пт","Сб","Вс"]
+    d = start
+    for i in range(7):
+        label = f"{weekdays[i]} {d.day:02d}"
+        if d == datetime.now(TZ).date():
+            label = f"🟩 {label}"
+        b.button(text=label, callback_data=f"d:{d.isoformat()}")
+        d += timedelta(days=1)
+    b.adjust(3,4)
+    return b.as_markup()
+
+def groups_kb():
+    b = InlineKeyboardBuilder()
+    for g in ["JFR-237"]:
+        b.button(text=g, callback_data=f"g:{g}")
+    b.adjust(1)
+    return b.as_markup()
+
+async def safe_edit(message, *, text=None, reply_markup=None):
+    """Безопасное редактирование (тихо игнорирует 'message is not modified')."""
+    try:
+        if text is not None:
+            await message.edit_text(text, reply_markup=reply_markup)
+        else:
+            await message.edit_reply_markup(reply_markup=reply_markup)
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e).lower():
+            if text is not None and reply_markup is not None:
+                try:
+                    await message.edit_reply_markup(reply_markup=reply_markup)
+                except TelegramBadRequest as e2:
+                    if "message is not modified" not in str(e2).lower():
+                        raise
+        else:
+            raise
+
+# ================== Parsing helpers ==================
+SUP = str.maketrans({
+    "⁰":"0","¹":"1","²":"2","³":"3","⁴":"4","⁵":"5","⁶":"6","⁷":"7","⁸":"8","⁹":"9",
+    "º":"0","˙":"", "’":"'", "ː":":"
+})
+
+def normalize_sup(s: str) -> str:
+    s = (s or "").strip().translate(SUP)
+    s = s.replace("–", "-").replace("—", "-").replace("‒", "-")
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def parse_ora_cell(ora: str):
+    """'9⁴⁵-11¹⁵' / '15:00–16:30' -> ('09:45','11:15')"""
+    o = normalize_sup(ora)
+    m = re.search(r'(\d{1,2})[:\. ]?(\d{2})\s*-\s*(\d{1,2})[:\. ]?(\d{2})', o)
+    if not m:
+        return None, None
+    h1, m1, h2, m2 = map(int, m.groups())
+    return f"{h1:02d}:{m1:02d}", f"{h2:02d}:{m2:02d}"
+
+def parse_group_cell(txt: str):
+    """
+    В ячейке колонки группы обычно 3 строки:
+    title
+    teacher
+    s. 423 / sala / aud.
+    """
+    t = (txt or "").strip()
+    if not t:
+        return None, None, None
+    lines = [re.sub(r"\s+", " ", x.strip()) for x in t.splitlines() if x.strip()]
+    if not lines:
+        return None, None, None
+
+    title = lines[0]
+    teacher = None
+    room = None
+
+    for line in lines[1:]:
+        m = re.search(r'\b(?:sală|s\.?|aud\.?|cab\.?|ауд\.?)\s*([0-9A-Za-z/\\\-]+)', line, re.IGNORECASE)
+        if m and not room:
+            room = m.group(1)
+
+    for line in lines[1:]:
+        if room and re.search(r'\b(?:sală|s\.?|aud\.?|cab\.?|ауд\.?)\b', line, re.IGNORECASE):
+            continue
+        if any(w in line.lower() for w in ["dr.", "conf.", "prof.", "lector", "asistent", "universitar", "univ", "cadru"]):
+            teacher = line
+            break
+        if re.search(r'[A-ZĂÂÎȘȚ]\.|[A-ZĂÂÎȘȚ][a-zăâîșț]+', line):
+            teacher = line
+            break
+
+    return title, teacher, room
+
+def normalize_date(s: str):
+    s = (s or "").strip().lower()
+    # уберём день недели (luni, marti, miercuri...)
+    s = re.sub(r"\b(luni|marți|marti|miercuri|joi|vineri|sâmbătă|duminică)\b", "", s, flags=re.IGNORECASE)
+    s = s.strip()
+    m = re.fullmatch(r"(\d{1,2})\.(\d{1,2})\.(\d{4})", s)
+    if m:
+        d, mnt, y = map(int, m.groups())
+        return datetime(y, mnt, d).strftime("%Y-%m-%d")
+    return None
+
+
+# ================== DOCX parser for 4-column layout ==================
+def parse_docx_to_db(path: str, target_group: str):
+    doc = DocxDocument(path)
+    clear_group(target_group)
+    inserted = 0
+
+    for table in doc.tables:
+        if len(table.rows) < 2 or len(table.columns) < 4:
+            continue
+
+        # заголовок может быть в 1-2 строках
+        hdr = [re.sub(r"\s+", " ", c.text).strip().lower() for c in table.rows[0].cells]
+        if len(table.rows) > 1:
+            hdr2 = [re.sub(r"\s+", " ", c.text).strip().lower() for c in table.rows[1].cells]
+            for i in range(min(len(hdr), len(hdr2))):
+                if hdr2[i] and hdr2[i] not in hdr[i]:
+                    hdr[i] = (hdr[i] + " " + hdr2[i]).strip()
+
+        def has(s, *keys): return any(k in s for k in keys)
+        if not has(hdr[0], "data", "date"):  # Data
+            continue
+        if not has(hdr[1], "ora", "time"):   # Ora
+            continue
+
+        j_col = b_col = None
+        for idx, h in enumerate(hdr):
+            if "jfr" in h:
+                j_col = idx
+            if "bfr" in h:
+                b_col = idx
+        if j_col is None and b_col is None:
+            continue
+
+        # где начинается контент
+        start_row = 2 if any("jfr" in x or "bfr" in x for x in hdr) else 1
+
+        current_date = None
+        for r in table.rows[start_row:]:
+            cells = [c.text for c in r.cells]
+            if len(cells) < 2:
+                continue
+
+            date_raw = re.sub(r"\s+", " ", (cells[0] or "").strip())
+            date_norm = normalize_date(date_raw) if date_raw else current_date
+
+            time_raw = re.sub(r"\s+", " ", (cells[1] or "").strip())
+            t1, t2 = parse_ora_cell(time_raw)
+
+            # выбираем колонку нашей группы
+            col = j_col if target_group.upper().startswith("JFR") else b_col
+            if col is None:
+                continue
+
+            gcell = cells[col] if col < len(cells) else ""
+            title, teacher, room = parse_group_cell(gcell)
+
+            if not date_norm:
+                continue
+            if not title:
+                current_date = date_norm
+                continue
+
+            insert_event(date_norm, t1, t2, title, teacher, room, target_group)
+            inserted += 1
+            current_date = date_norm
+
+    return inserted
+
+# ================== Import from disk ==================
+def import_from_docx_path(target_group: str) -> int:
+    docx_path = os.getenv("DOCX_PATH", "").strip()
+    docx_glob = os.getenv("DOCX_GLOB", "").strip()
+
+    paths = []
+    if docx_path:
+        p = os.path.abspath(docx_path)
+        if os.path.isfile(p):
+            paths = [p]
+        else:
+            print(f"[DOCX] DOCX_PATH указан, но файла нет: {p}")
+    elif docx_glob:
+        paths = sorted(glob.glob(docx_glob))
+        if not paths:
+            print(f"[DOCX] DOCX_GLOB указан, но файлов не найдено по маске: {docx_glob}")
+    else:
+        print("[DOCX] Ни DOCX_PATH, ни DOCX_GLOB не заданы в .env")
+
+    if not paths:
+        return 0
+
+    print(f"[DOCX] Кандидаты к импорту: {paths}")
+    clear_group(target_group)
+    total = 0
+
+    for p in paths:
+        try:
+            if not p.lower().endswith(".docx"):
+                print(f"[DOCX] Пропущено (не .docx): {p}")
+                continue
+            if not zipfile.is_zipfile(p):
+                print(f"[DOCX] Не ZIP → это невалидный .docx (возможно .doc): {p}")
+                continue
+            cnt = parse_docx_to_db(p, target_group=target_group)
+            print(f"[DOCX] Импортировано из {os.path.basename(p)}: {cnt}")
+            total += cnt
+        except PackageNotFoundError:
+            print(f"[DOCX] PackageNotFoundError → это не .docx: {p}")
+        except Exception as e:
+            print(f"[DOCX] Ошибка импорта {p}: {e}")
+    return total
+
+# ================== BOT ==================
+router = Router()
+USER_GROUP = {}
+
+@router.message(Command("start"))
+async def cmd_start(m: Message):
+    USER_GROUP[m.from_user.id] = DEFAULT_GROUP
+    await m.answer(
+        f"Привет! Я бот-расписание 📚\n\n"
+        f"По умолчанию группа: <b>{GROUP_LABELS.get(DEFAULT_GROUP, DEFAULT_GROUP)}</b>\n"
+        f"Используй кнопки ниже 👇",
+        reply_markup=main_menu()
+    )
+
+@router.message(Command("help"))
+async def cmd_help(m: Message):
+    await m.answer(
+        "Команды:\n"
+        "• 📅 Сегодня — расписание на сегодня\n"
+        "• 🗂 Эта неделя — все дни недели\n"
+        "• 🗓 Выбрать день недели — навигация по дням\n"
+        "• /reload — переимпортировать .docx из диска\n"
+        "• /debug_import — показать что видим на диске\n"
+        "• /docinfo — проверить файл DOCX\n"
+        "• /reload_env — перечитать .env"
+    )
+
+@router.message(F.text == "📅 Сегодня")
+async def today(m: Message):
+    group = USER_GROUP.get(m.from_user.id, DEFAULT_GROUP)
+    d = datetime.now(TZ).date()
+    rows = fetch_day_for_group(d, group)
+    await m.answer(fmt_day_block(d, rows, group), reply_markup=days_keyboard(d))
+
+@router.message(F.text == "🗂 Эта неделя")
+async def this_week(m: Message):
+    group = USER_GROUP.get(m.from_user.id, DEFAULT_GROUP)
+    start, end = week_bounds(datetime.now(TZ).date())
+    rows = fetch_week_for_group(start, end, group)
+    if not rows:
+        return await m.answer("На эту неделю занятий нет.", reply_markup=days_keyboard(start))
+    by_day = {}
+    for r in rows:
+        by_day.setdefault(r["date"], []).append(r)
+    parts = []
+    d = start
+    while d <= end:
+        parts.append(fmt_day_block(d, by_day.get(d.strftime("%Y-%m-%d"), []), group))
+        d += timedelta(days=1)
+    await m.answer("\n\n".join(parts), reply_markup=days_keyboard(start))
+
+@router.message(F.text == "🗓 Выбрать день недели")
+async def pick_day(m: Message):
+    await m.answer("Выбери день:", reply_markup=days_keyboard(datetime.now(TZ).date()))
+
+@router.callback_query(F.data.startswith("wk:"))
+async def change_week(c: CallbackQuery):
+    anchor = date.fromisoformat(c.data.split(":")[1])
+    try:
+        await safe_edit(c.message, reply_markup=days_keyboard(anchor))
+    finally:
+        await c.answer("Неделя обновлена")
+
+@router.callback_query(F.data.startswith("d:"))
+async def show_day(c: CallbackQuery):
+    d = date.fromisoformat(c.data.split(":")[1])
+    group = USER_GROUP.get(c.from_user.id, DEFAULT_GROUP)
+    rows = fetch_day_for_group(d, group)
+    text = fmt_day_block(d, rows, group)
+    await safe_edit(c.message, text=text, reply_markup=days_keyboard(d))
+    await c.answer()
+
+@router.message(F.text == "👥 Выбрать группу")
+async def choose_group(m: Message):
+    await m.answer("Выбери группу:", reply_markup=groups_kb())
+
+@router.callback_query(F.data.startswith("g:"))
+async def set_group(c: CallbackQuery):
+    g = c.data.split(":")[1]
+    USER_GROUP[c.from_user.id] = g
+    await c.answer(f"Группа установлена: {g}")
+    await c.message.edit_text(f"Группа сохранена: <b>{GROUP_LABELS.get(g, g)}</b>")
+
+@router.message(Command("reload"))
+async def cmd_reload(m: Message):
+    group = USER_GROUP.get(m.from_user.id, DEFAULT_GROUP)
+    imported = import_from_docx_path(group)
+    if imported:
+        await m.answer(f"🔄 Импорт завершён.\nГруппа: <b>{group}</b>\nЗаписей: <b>{imported}</b>")
+    else:
+        await m.answer("Файл(ы) не найдены или парсер не нашёл пар. Проверь .env / формат.")
+
+@router.message(Command("debug_import"))
+async def debug_import(m: Message):
+    here = os.getcwd()
+    docx_path = os.getenv("DOCX_PATH", "")
+    docx_glob = os.getenv("DOCX_GLOB", "")
+    files_here = sorted([f for f in os.listdir(here) if f.lower().endswith((".docx", ".doc"))])
+    globbed = sorted(glob.glob(docx_glob)) if docx_glob else []
+    msg = (
+        "🛠 Debug import\n"
+        f"cwd: <code>{here}</code>\n"
+        f"DOCX_PATH: <code>{docx_path}</code>\n"
+        f"DOCX_GLOB: <code>{docx_glob}</code>\n"
+        f"В папке (.doc/.docx): {files_here}\n"
+        f"По маске: {globbed}"
+    )
+    await m.answer(msg)
+
+@router.message(Command("docinfo"))
+async def cmd_docinfo(m: Message):
+    p = os.getenv("DOCX_PATH", "").strip()
+    if not p:
+        return await m.answer("DOCX_PATH не задан в .env")
+    ap = os.path.abspath(p)
+    if not os.path.isfile(ap):
+        return await m.answer(f"Файл не найден:\n<code>{ap}</code>")
+    try:
+        info = [f"Путь: <code>{ap}</code>", f"Размер: {os.path.getsize(ap)} байт", f"ZIP: {zipfile.is_zipfile(ap)}"]
+        doc = DocxDocument(ap)
+        info += [f"Параграфов: {len(doc.paragraphs)}", f"Таблиц: {len(doc.tables)}"]
+        await m.answer("🧪 DOCX info:\n" + "\n".join(info))
+    except PackageNotFoundError:
+        await m.answer("❌ Это не .docx (или файл битый). Конвертируй .doc → .docx.")
+    except Exception as e:
+        await m.answer(f"❌ Не смог открыть через python-docx:\n<code>{e}</code>")
+
+@router.message(Command("reload_env"))
+async def reload_env(m: Message):
+    load_dotenv(override=True)
+    await m.answer("♻️ .env перечитан. Запусти /reload для повторного импорта.")
+
+# ================== MAIN ==================
+async def main():
+    init_db()
+    imported = import_from_docx_path(DEFAULT_GROUP)
+    if imported:
+        print(f"[DOCX] Авто-импорт: {imported} записей для {DEFAULT_GROUP}")
+    else:
+        print("[DOCX] Авто-импорт: файлов не найдено или пар не извлечено")
+
+    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+    dp = Dispatcher()
+    dp.include_router(router)
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
